@@ -5,10 +5,23 @@
 # * c-ares
 # * openSSL
 
+$TARGET_ARCH = $1
+if [[ -z "$TARGET_ARCH" ]]; then
+    echo "No target arch specified, using default x86_64-linux"
+    TARGET_ARCH="x86_64-linux"
+fi
+
 # Compiler and path
 PREFIX=$PWD/pkg/aria2go/aria2-lib
-C_COMPILER="gcc"
-CXX_COMPILER="g++"
+C_COMPILER="zig cc -target $TARGET_ARCH"
+CXX_COMPILER="zig c++ -target $TARGET_ARCH"
+
+# check if zig is installed
+if ! [[ -x "$(command -v zig)" ]]; then
+    echo 'Error: zig is not installed.' >&2
+    C_COMPILER="gcc"
+    CXX_COMPILER="g++"
+fi
 
 NPROC=`nproc`
 # check if nproc is a command
@@ -18,10 +31,8 @@ if ! [[ -x "$(command -v nproc)" ]]; then
 fi
 
 # Check tool for download
-aria2c --help > /dev/null
-if [[ "$?" -eq 0 ]]; then
-    DOWNLOADER="aria2c --check-certificate=false"
-else
+DOWNLOADER="aria2c --check-certificate=false"
+if ! [[ -x "$(command -v aria2c)" ]]; then
     DOWNLOADER="wget -c"
 fi
 
