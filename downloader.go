@@ -7,15 +7,18 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
-	"github.com/jaskaranSM/aria2go"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 )
 
 const (
@@ -23,49 +26,6 @@ const (
 	retryDelay = 5 * time.Second
 	bufferSize = 1048576
 )
-
-type ProgressReporter interface {
-	SetGameTitle(title string)
-	UpdateDownloadProgress(downloaded, speed int64, filePath string)
-	UpdateDecryptionProgress(progress float64)
-	Cancelled() bool
-	SetCancelled()
-	SetDownloadSize(size int64)
-	SetTotalDownloaded(total int64)
-	AddToTotalDownloaded(toAdd int64)
-}
-
-type Aria2gocNotifier struct {
-	start    chan string
-	complete chan bool
-}
-
-func newAria2goNotifier(start chan string, complete chan bool) aria2go.Notifier {
-	return Aria2gocNotifier{
-		start:    start,
-		complete: complete,
-	}
-}
-
-func (n Aria2gocNotifier) OnStart(gid string) {
-	n.start <- gid
-}
-
-func (n Aria2gocNotifier) OnPause(gid string) {
-	return
-}
-
-func (n Aria2gocNotifier) OnStop(gid string) {
-	return
-}
-
-func (n Aria2gocNotifier) OnComplete(gid string) {
-	n.complete <- false
-}
-
-func (n Aria2gocNotifier) OnError(gid string) {
-	n.complete <- true
-}
 
 func calculateDownloadSpeed(downloaded int64, startTime, endTime time.Time) int64 {
 	duration := endTime.Sub(startTime).Seconds()
@@ -75,81 +35,83 @@ func calculateDownloadSpeed(downloaded int64, startTime, endTime time.Time) int6
 	return 0
 }
 
-func downloadFile(ctx context.Context, progressReporter ProgressReporter, downloadURL, dstPath string, doRetries bool, buffer []byte, ariaSessionPath string) error {
-	fileName := filepath.Base(dstPath)
-
-	var startTime time.Time
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		client := aria2go.NewAria2(aria2go.Config{
-			Options: aria2go.Options{
-				"save-session": ariaSessionPath,
-			},
-		})
-
-		gid, err := client.AddUri(downloadURL, aria2go.Options{
-			"dir":      filepath.Dir(dstPath),
-			"out":      fileName,
-			"continue": "true",
-		})
-		if err != nil {
-			return err
-		}
-
-		go func() {
-			defer client.Shutdown()
-			client.Run()
-		}()
-
-		startNotif := make(chan string)
-		completeNotif := make(chan bool)
-		go func() {
-			quit := make(chan os.Signal, 1)
-			signal.Notify(quit, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
-
-			<-quit
-			completeNotif <- true
-		}()
-		client.SetNotifier(newAria2goNotifier(startNotif, completeNotif))
-
-		startTime = time.Now()
-		ticker := time.NewTicker(time.Millisecond * 500)
-		defer ticker.Stop()
-	loop:
-		for {
-			select {
-			case id := <-startNotif:
-				gid = id
-			case <-ticker.C:
-				downloaded := client.GetDownloadInfo(gid).BytesCompleted
-				progressReporter.UpdateDownloadProgress(downloaded, calculateDownloadSpeed(downloaded, startTime, time.Now()), fileName)
-			case errored := <-completeNotif:
-				if errored {
-					if doRetries && attempt < maxRetries {
-						time.Sleep(retryDelay)
-						break loop
-					}
-					return fmt.Errorf("write error after %d attempts: %+v", attempt, client.GetDownloadInfo(gid).ErrorCode)
-				}
-				downloaded := client.GetDownloadInfo(gid).BytesCompleted
-				progressReporter.UpdateDownloadProgress(downloaded, calculateDownloadSpeed(downloaded, startTime, time.Now()), fileName)
-				return nil
-			case <-ctx.Done():
-				return nil
-			}
-		}
-	}
-
-	return nil
+func newBar(name string, p *mpb.Progress) *mpb.Bar {
+	return p.AddBar(0,
+		mpb.BarRemoveOnComplete(),
+		mpb.PrependDecorators(
+			decor.Name(name, decor.WC{C: decor.DindentRight | decor.DextraSpace}),
+			decor.Counters(decor.SizeB1024(0), "% .2f / % .2f"),
+		),
+		mpb.AppendDecorators(
+			decor.EwmaETA(decor.ET_STYLE_GO, 30),
+			decor.Name(" ] "),
+			decor.EwmaSpeed(decor.SizeB1024(0), "% .2f", 60),
+		),
+	)
 }
 
-func DownloadTitle(cancelCtx context.Context, titleID, outputDirectory string, doDecryption bool, progressReporter ProgressReporter, deleteEncryptedContents bool, logger *Logger, ariaSessionPath string) error {
-	titleEntry := getTitleEntryFromTid(titleID)
+func downloadFile(ctx context.Context, bar *mpb.Bar, newTotal bool, downloadURL, dstPath string, doRetries bool) error {
+	req, err := http.NewRequest("GET", downloadURL, nil)
+	if err != nil {
+		return err
+	}
+	retries := 0
+retry:
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		if doRetries && retries < maxRetries {
+			fmt.Printf("retrying %+v\n", err)
+			retries += 1
+			goto retry
+		}
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return errors.New("status " + resp.Status)
+	}
 
-	progressReporter.SetTotalDownloaded(0)
-	progressReporter.SetGameTitle(titleEntry.Name)
+	f, _ := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY, 0644)
+	defer f.Close()
+	if newTotal {
+		bar.SetTotal(resp.ContentLength, false)
+	}
+	var proxyReader io.ReadCloser = resp.Body
+	if bar != nil {
+		proxyReader = bar.ProxyReader(resp.Body)
+		defer proxyReader.Close()
+	}
 
-	outputDir := strings.TrimRight(outputDirectory, "/\\")
+	_, err = io.Copy(f, proxyReader)
+	if err != nil {
+		if doRetries && retries < maxRetries {
+			fmt.Printf("retrying %+v\n", err)
+			retries += 1
+			goto retry
+		}
+	}
+	return err
+}
+
+func DownloadTitle(cancelCtx context.Context, titleEntry TitleEntry, outputDir string, p *mpb.Progress, logger *Logger) error {
+	defer func() {
+		if err := recover(); err != nil {
+			logger.Error("panic %d %s\n", titleEntry.TitleID, err)
+		}
+	}()
+
+	titleID := fmt.Sprintf("%016x", titleEntry.TitleID)
+	prog := newBar(titleEntry.Name, p)
+
+	outputDir = strings.TrimRight(outputDir, "/\\")
+	outputDir = filepath.Join(outputDir, titleID)
+
+	if f, err := os.Open(filepath.Join(outputDir, "title.json")); err == nil {
+		f.Close()
+		prog.SetTotal(0, true)
+		return nil
+	}
+
 	baseURL := fmt.Sprintf("http://ccs.cdn.c.shop.nintendowifi.net/ccs/download/%s", titleID)
 	titleIDBytes, err := hex.DecodeString(titleID)
 	if err != nil {
@@ -160,13 +122,8 @@ func DownloadTitle(cancelCtx context.Context, titleID, outputDirectory string, d
 		return err
 	}
 
-	buffer := make([]byte, bufferSize)
-
 	tmdPath := filepath.Join(outputDir, "title.tmd")
-	if err := downloadFile(cancelCtx, progressReporter, fmt.Sprintf("%s/%s", baseURL, "tmd"), tmdPath, true, buffer, ariaSessionPath); err != nil {
-		if progressReporter.Cancelled() {
-			return nil
-		}
+	if err := downloadFile(cancelCtx, nil, false, fmt.Sprintf("%s/%s", baseURL, "tmd"), tmdPath, true); err != nil {
 		return err
 	}
 
@@ -181,10 +138,7 @@ func DownloadTitle(cancelCtx context.Context, titleID, outputDirectory string, d
 	}
 
 	tikPath := filepath.Join(outputDir, "title.tik")
-	if err := downloadFile(cancelCtx, progressReporter, fmt.Sprintf("%s/%s", baseURL, "cetk"), tikPath, false, buffer, ariaSessionPath); err != nil {
-		if progressReporter.Cancelled() {
-			return nil
-		}
+	if err := downloadFile(cancelCtx, nil, false, fmt.Sprintf("%s/%s", baseURL, "cetk"), tikPath, false); err != nil {
 		titleKey, err := GenerateKey(titleID)
 		if err != nil {
 			return err
@@ -218,13 +172,10 @@ func DownloadTitle(cancelCtx context.Context, titleID, outputDirectory string, d
 		contentSizes = append(contentSizes, contentSizeInt)
 	}
 
-	progressReporter.SetDownloadSize(int64(titleSize))
+	prog.SetTotal(int64(titleSize), false)
 
-	cert, err := GenerateCert(tmdData, contentCount, progressReporter, cancelCtx, buffer, ariaSessionPath)
+	cert, err := GenerateCert(tmdData, contentCount, cancelCtx)
 	if err != nil {
-		if progressReporter.Cancelled() {
-			return nil
-		}
 		return err
 	}
 
@@ -264,42 +215,74 @@ func DownloadTitle(cancelCtx context.Context, titleID, outputDirectory string, d
 			return err
 		}
 		filePath := filepath.Join(outputDir, fmt.Sprintf("%08X.app", id))
-		if err := downloadFile(cancelCtx, progressReporter, fmt.Sprintf("%s/%08X", baseURL, id), filePath, true, buffer, ariaSessionPath); err != nil {
-			if progressReporter.Cancelled() {
-				break
-			}
+		if err := downloadFile(cancelCtx, prog, false, fmt.Sprintf("%s/%08X", baseURL, id), filePath, true); err != nil {
 			return err
 		}
-		progressReporter.AddToTotalDownloaded(int64(contentSizes[i]))
 
 		if tmdData[offset+7]&0x2 == 2 {
 			filePath = filepath.Join(outputDir, fmt.Sprintf("%08X.h3", id))
-			if err := downloadFile(cancelCtx, progressReporter, fmt.Sprintf("%s/%08X.h3", baseURL, id), filePath, true, buffer, ariaSessionPath); err != nil {
-				if progressReporter.Cancelled() {
-					break
-				}
+			if err := downloadFile(cancelCtx, nil, false, fmt.Sprintf("%s/%08X.h3", baseURL, id), filePath, true); err != nil {
 				return err
 			}
 			content.Hash = tmdData[offset+16 : offset+0x14]
 			content.ID = fmt.Sprintf("%08X", id)
 			content.Size = int64(contentSizes[i])
-			if err := checkContentHashes(outputDirectory, content, cipherHashTree); err != nil {
-				if progressReporter.Cancelled() {
-					break
-				}
+			if err := checkContentHashes(outputDir, content, cipherHashTree); err != nil {
 				return err
 			}
 		}
-		if progressReporter.Cancelled() {
-			break
-		}
 	}
 
-	if doDecryption && !progressReporter.Cancelled() {
-		if err := DecryptContents(outputDir, progressReporter, deleteEncryptedContents); err != nil {
-			return err
-		}
+	f, err := os.Create(filepath.Join(outputDir, "title.json"))
+	if err != nil {
+		return err
 	}
+	json.NewEncoder(f).Encode(&titleEntry)
+	f.Close()
+	prog.SetCurrent(int64(titleSize))
 
 	return nil
+}
+
+func GetTitleSize(ctx context.Context, entry TitleEntry) (uint64, error) {
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Printf("%s\n", err)
+		}
+	}()
+
+	titleID := fmt.Sprintf("%016x", entry.TitleID)
+
+	baseURL := fmt.Sprintf("http://ccs.cdn.c.shop.nintendowifi.net/ccs/download/%s", titleID)
+
+	res, err := http.DefaultClient.Get(fmt.Sprintf("%s/%s", baseURL, "tmd"))
+	if err != nil {
+		return 0, err
+	}
+	tmdData, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		return 0, err
+	}
+
+	var contentCount uint16
+	if err := binary.Read(bytes.NewReader(tmdData[478:480]), binary.BigEndian, &contentCount); err != nil {
+		return 0, err
+	}
+
+	var titleSize uint64
+	var contentSizes []uint64
+	for i := 0; i < int(contentCount); i++ {
+		contentDataLoc := 0xB04 + (0x30 * i)
+
+		var contentSizeInt uint64
+		if err := binary.Read(bytes.NewReader(tmdData[contentDataLoc+8:contentDataLoc+8+8]), binary.BigEndian, &contentSizeInt); err != nil {
+			return 0, err
+		}
+
+		titleSize += contentSizeInt
+		contentSizes = append(contentSizes, contentSizeInt)
+	}
+
+	return titleSize, nil
 }

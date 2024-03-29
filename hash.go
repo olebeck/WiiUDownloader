@@ -1,6 +1,7 @@
 package wiiudownloader
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha1"
@@ -8,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 )
 
 var commonKey = []byte{0xD7, 0xB0, 0x04, 0x02, 0x65, 0x9B, 0xA2, 0xAB, 0xD2, 0xCB, 0x0D, 0xB2, 0x7F, 0xA2, 0xB6, 0x56}
@@ -25,7 +25,7 @@ func checkContentHashes(path string, content contentInfo, cipherHashTree cipher.
 	defer encryptedFile.Close()
 
 	h3Hash := sha1.Sum(h3Data)
-	if !reflect.DeepEqual(h3Hash[:8], content.Hash[:8]) {
+	if !bytes.Equal(h3Hash[:8], content.Hash[:8]) {
 		return errors.New("h3 Hash mismatch")
 	}
 
@@ -55,13 +55,13 @@ func checkContentHashes(path string, content contentInfo, cipherHashTree cipher.
 		h1HashesHash := sha1.Sum(h1Hashes)
 		h2HashesHash := sha1.Sum(h2Hashes)
 
-		if !reflect.DeepEqual(h0HashesHash[:], h1Hash) {
+		if !bytes.Equal(h0HashesHash[:], h1Hash) {
 			return errors.New("h0 Hashes Hash mismatch")
 		}
-		if !reflect.DeepEqual(h1HashesHash[:], h2Hash) {
+		if !bytes.Equal(h1HashesHash[:], h2Hash) {
 			return errors.New("h1 Hashes Hash mismatch")
 		}
-		if !reflect.DeepEqual(h2HashesHash[:], h3Hash) {
+		if !bytes.Equal(h2HashesHash[:], h3Hash) {
 			return errors.New("h2 Hashes Hash mismatch")
 		}
 		encryptedFile.Seek(0xFC00, 1)

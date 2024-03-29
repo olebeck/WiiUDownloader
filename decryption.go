@@ -15,7 +15,6 @@ extern void callProgressCallback(int progress);
 import "C"
 import (
 	"errors"
-	"time"
 	"unsafe"
 
 	"golang.org/x/sync/errgroup"
@@ -28,7 +27,7 @@ func callProgressCallback(progress C.int) {
 
 var progressChan chan int
 
-func DecryptContents(path string, progress ProgressReporter, deleteEncryptedContents bool) error {
+func DecryptContents(path string, deleteEncryptedContents bool) error {
 	progressChan = make(chan int)
 
 	errGroup := errgroup.Group{}
@@ -36,13 +35,6 @@ func DecryptContents(path string, progress ProgressReporter, deleteEncryptedCont
 	errGroup.Go(func() error {
 		return runDecryption(path, deleteEncryptedContents)
 	})
-
-	for progressInt := range progressChan {
-		if progressInt > 0 {
-			progress.UpdateDecryptionProgress(float64(progressInt) / 100)
-		}
-		time.Sleep(time.Millisecond * 10)
-	}
 
 	return errGroup.Wait()
 }
